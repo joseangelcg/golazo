@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -433,38 +432,13 @@ func (c *Client) LeagueMatches(ctx context.Context, leagueID int) ([]api.Match, 
 	return []api.Match{}, nil
 }
 
-// parentLeagueByName maps league name patterns to their parent league IDs.
-// Some competitions have sub-leagues for different stages/seasons that don't have
-// their own standings - we detect these by name and use the parent league.
-// This is more robust than mapping sub-league IDs which change each stage/season.
-var parentLeagueByName = map[string]int{
-	"Champions League":  42,
-	"Europa League":     73,
-	"Conference League": 10216,
-	"Libertadores":      45,
-	"Sudamericana":      299,
-}
-
-// getParentLeagueID returns the parent league ID if the league name matches a known pattern.
-// Returns the original leagueID if no parent match is found.
-func getParentLeagueID(leagueName string, leagueID int) int {
-	for pattern, parentID := range parentLeagueByName {
-		if strings.Contains(leagueName, pattern) {
-			return parentID
-		}
-	}
-	return leagueID
-}
-
 // LeagueTable retrieves the league table/standings for a specific league.
 // Handles both regular league tables and knockout competition tables (e.g., Champions League).
 // Uses league name to detect parent leagues for knockout competitions.
 func (c *Client) LeagueTable(ctx context.Context, leagueID int, leagueName string) ([]api.LeagueTableEntry, error) {
-	// First, determine the effective league ID (may be parent for knockout competitions)
-	effectiveID := getParentLeagueID(leagueName, leagueID)
 
 	// Fetch standings using the effective league ID
-	return c.fetchLeagueTable(ctx, effectiveID)
+	return c.fetchLeagueTable(ctx, leagueID)
 }
 
 // fetchLeagueTable fetches the league table for a specific league ID.
@@ -472,7 +446,7 @@ func (c *Client) fetchLeagueTable(ctx context.Context, leagueID int) ([]api.Leag
 	// Apply rate limiting
 	c.rateLimiter.Wait()
 
-	url := fmt.Sprintf("%s/leagues?id=%d", c.baseURL, leagueID)
+	url := fmt.Sprintf("%s/tltable?leagueId=%d", c.baseURL, leagueID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -491,24 +465,16 @@ func (c *Client) fetchLeagueTable(ctx context.Context, leagueID int) ([]api.Leag
 		return nil, fmt.Errorf("unexpected status code %d for league %d table", resp.StatusCode, leagueID)
 	}
 
-	// FotMob returns table at either:
-	// - Regular leagues: table[0].data.table.all[]
-	// - Knockout competitions (e.g., Champions League): table[0].data.tables[0].table.all[]
-	var response struct {
-		Table []struct {
-			Data struct {
-				// Regular league table
-				Table struct {
-					All []fotmobTableRow `json:"all"`
-				} `json:"table"`
-				// Knockout competition tables (e.g., Champions League)
-				Tables []struct {
-					Table struct {
-						All []fotmobTableRow `json:"all"`
-					} `json:"table"`
-				} `json:"tables"`
-			} `json:"data"`
-		} `json:"table"`
+	//Decode Fotmob response for LeagueTable
+	var tableData []fotmobTableRow
+
+	// FotMob returns lttable at: response[0].data.table.all[]
+	var response []struct {
+		Data struct {
+			Table struct {
+				All []fotmobTableRow `json:"all"`
+			} `json:"table"`
+		} `json:"data"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
@@ -516,16 +482,8 @@ func (c *Client) fetchLeagueTable(ctx context.Context, leagueID int) ([]api.Leag
 	}
 
 	// Extract table rows - try regular format first, then knockout format
-	var tableData []fotmobTableRow
-	if len(response.Table) > 0 {
-		data := response.Table[0].Data
-		// Try regular league format first
-		if len(data.Table.All) > 0 {
-			tableData = data.Table.All
-		} else if len(data.Tables) > 0 && len(data.Tables[0].Table.All) > 0 {
-			// Fall back to knockout competition format
-			tableData = data.Tables[0].Table.All
-		}
+	if len(response[0].Data.Table.All) > 0 {
+		tableData = response[0].Data.Table.All
 	}
 
 	if len(tableData) == 0 {
